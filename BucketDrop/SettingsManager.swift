@@ -21,6 +21,7 @@ final class SettingsManager {
         static let region = "s3_region"
         static let endpoint = "s3_endpoint"
         static let publicUrlBase = "s3_public_url_base"
+        static let folderPrefix = "s3_folder_prefix"
     }
     
     // Stored properties for observation
@@ -30,6 +31,7 @@ final class SettingsManager {
     private(set) var _region: String = "us-east-1"
     private(set) var _endpoint: String = ""
     private(set) var _publicUrlBase: String = ""
+    private(set) var _folderPrefix: String = ""
     
     var accessKeyId: String {
         get { _accessKeyId }
@@ -78,6 +80,14 @@ final class SettingsManager {
             defaults.set(newValue, forKey: Keys.publicUrlBase)
         }
     }
+
+    var folderPrefix: String {
+        get { _folderPrefix }
+        set {
+            _folderPrefix = newValue
+            defaults.set(newValue, forKey: Keys.folderPrefix)
+        }
+    }
     
     var isConfigured: Bool {
         !_accessKeyId.isEmpty && !_secretAccessKey.isEmpty && !_bucket.isEmpty
@@ -91,6 +101,7 @@ final class SettingsManager {
         _region = defaults.string(forKey: Keys.region) ?? "us-east-1"
         _endpoint = defaults.string(forKey: Keys.endpoint) ?? ""
         _publicUrlBase = defaults.string(forKey: Keys.publicUrlBase) ?? ""
+        _folderPrefix = defaults.string(forKey: Keys.folderPrefix) ?? ""
     }
     
     // MARK: - Keychain

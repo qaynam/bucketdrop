@@ -16,6 +16,7 @@ struct SettingsView: View {
     @State private var region: String = ""
     @State private var endpoint: String = ""
     @State private var publicUrlBase: String = ""
+    @State private var folderPrefix: String = ""
     
     @State private var isTesting = false
     @State private var testResult: TestResult?
@@ -39,10 +40,11 @@ struct SettingsView: View {
             Section {
                 TextField("S3 Endpoint", text: $endpoint, prompt: Text("https://xxx.r2.cloudflarestorage.com"))
                 TextField("Public URL Base", text: $publicUrlBase, prompt: Text("https://static.example.com"))
+                TextField("Folder/Prefix (optional)", text: $folderPrefix, prompt: Text("mac"))
             } header: {
                 Text("S3-Compatible (R2, MinIO, etc.)")
             } footer: {
-                Text("For Cloudflare R2: paste the S3 API endpoint URL and set region to 'auto'. Public URL Base is your custom domain for accessing files.")
+                Text("For Cloudflare R2: paste the S3 API endpoint URL and set region to 'auto'. Public URL Base is your custom domain for accessing files. Folder/Prefix stores files under that path (e.g. 'mac').")
             }
             
             Section {
@@ -127,6 +129,7 @@ struct SettingsView: View {
         region = settings.region
         endpoint = settings.endpoint
         publicUrlBase = settings.publicUrlBase
+        folderPrefix = settings.folderPrefix
     }
     
     private func saveSettings() {
@@ -136,6 +139,7 @@ struct SettingsView: View {
         settings.region = region.isEmpty ? "us-east-1" : region
         settings.endpoint = endpoint
         settings.publicUrlBase = publicUrlBase
+        settings.folderPrefix = folderPrefix
         
         testResult = .success
         
@@ -155,12 +159,16 @@ struct SettingsView: View {
         let oldBucket = settings.bucket
         let oldRegion = settings.region
         let oldEndpoint = settings.endpoint
+        let oldPublicUrlBase = settings.publicUrlBase
+        let oldFolderPrefix = settings.folderPrefix
         
         settings.accessKeyId = accessKeyId
         settings.secretAccessKey = secretAccessKey
         settings.bucket = bucket
         settings.region = region.isEmpty ? "us-east-1" : region
         settings.endpoint = endpoint
+        settings.publicUrlBase = publicUrlBase
+        settings.folderPrefix = folderPrefix
         
         Task {
             do {
@@ -177,6 +185,8 @@ struct SettingsView: View {
                     settings.bucket = oldBucket
                     settings.region = oldRegion
                     settings.endpoint = oldEndpoint
+                    settings.publicUrlBase = oldPublicUrlBase
+                    settings.folderPrefix = oldFolderPrefix
                     
                     testResult = .failure(error.localizedDescription)
                     isTesting = false

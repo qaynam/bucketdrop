@@ -32,6 +32,7 @@ Bucketdrop is a simple macOS menubar app for uploading files to S3-compatible st
 4. For S3-compatible services (R2, MinIO):
    - **S3 Endpoint** - Your service's S3 API endpoint
    - **Public URL Base** - Your custom domain for accessing files
+   - **Folder/Prefix (optional)** - Upload into a subfolder (e.g., `mac`)
 5. Click "Test Connection" to verify, then "Save"
 
 ## Usage

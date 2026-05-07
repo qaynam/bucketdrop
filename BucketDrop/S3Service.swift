@@ -32,7 +32,8 @@ actor S3Service {
         
         let data = try Data(contentsOf: fileURL)
         let filename = fileURL.lastPathComponent
-        let key = "\(UUID().uuidString.prefix(8))-\(filename)"
+        let baseKey = "\(UUID().uuidString.prefix(8))-\(filename)"
+        let key = buildObjectKey(baseKey)
         
         let contentType = mimeType(for: fileURL.pathExtension)
         
@@ -54,7 +55,8 @@ actor S3Service {
         let endpoint = buildEndpoint()
         let signingPath = buildSigningPath(objectKey: nil)
         
-        let urlString = "\(endpoint)/?list-type=2&max-keys=50"
+        let query = buildListQuery()
+        let urlString = "\(endpoint)/?\(query)"
         guard let url = URL(string: urlString) else {
             throw S3Error(message: "Invalid URL")
         }
@@ -65,7 +67,7 @@ actor S3Service {
         let headers = try signRequest(
             method: "GET",
             path: signingPath,
-            query: "list-type=2&max-keys=50",
+            query: query,
             headers: ["host": host],
             payload: Data()
         )
@@ -289,19 +291,24 @@ actor S3Service {
     private func isCustomEndpoint() -> Bool {
         return !settings.endpoint.isEmpty
     }
+
+    private func isCustomEndpointVirtualHostedStyle() -> Bool {
+        guard isCustomEndpoint(),
+              let host = URL(string: settings.endpoint)?.host else {
+            return false
+        }
+        return host.hasPrefix("\(settings.bucket).")
+    }
     
     private func buildHost() -> String {
-        let bucket = settings.bucket
-        let region = settings.region
-        
         if isCustomEndpoint() {
-            // Custom endpoint (like Cloudflare R2, MinIO, etc.)
-            // R2 and most S3-compatible services use path-style, so host is just the endpoint host
             if let url = URL(string: settings.endpoint), let host = url.host {
                 return host
             }
         }
-        
+
+        let bucket = settings.bucket
+        let region = settings.region
         return "\(bucket).s3.\(region).amazonaws.com"
     }
     
@@ -310,8 +317,12 @@ actor S3Service {
         let region = settings.region
         
         if isCustomEndpoint() {
-            // Custom endpoint (R2, MinIO, etc.) - use path-style: endpoint/bucket
             let base = settings.endpoint.hasSuffix("/") ? String(settings.endpoint.dropLast()) : settings.endpoint
+            if isCustomEndpointVirtualHostedStyle() {
+                // Endpoint already includes the bucket in host (bucket.endpoint.com)
+                return base
+            }
+            // Path-style: endpoint/bucket
             return "\(base)/\(bucket)"
         }
         
@@ -322,6 +333,15 @@ actor S3Service {
         let bucket = settings.bucket
         
         if isCustomEndpoint() {
+            // Virtual-hosted style for custom endpoint: / or /key
+            if isCustomEndpointVirtualHostedStyle() {
+                if let key = objectKey {
+                    let encodedKey = awsURLEncodePath(key)
+                    return "/\(encodedKey)"
+                }
+                return "/"
+            }
+
             // Path-style: /bucket or /bucket/key
             if let key = objectKey {
                 let encodedKey = awsURLEncodePath(key)
@@ -347,6 +367,31 @@ actor S3Service {
         }
         
         return "\(buildEndpoint())/\(encodedKey)"
+    }
+
+    private func buildObjectKey(_ baseKey: String) -> String {
+        guard let prefix = normalizedFolderPrefix() else {
+            return baseKey
+        }
+        return "\(prefix)/\(baseKey)"
+    }
+
+    private func buildListQuery() -> String {
+        var parts: [String] = ["list-type=2", "max-keys=50"]
+        if let prefix = normalizedFolderPrefix() {
+            let encodedPrefix = awsURLEncodeQueryValue("\(prefix)/")
+            parts.append("prefix=\(encodedPrefix)")
+        }
+        return parts.joined(separator: "&")
+    }
+
+    private func normalizedFolderPrefix() -> String? {
+        let trimmed = settings.folderPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        let cleaned = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return cleaned.isEmpty ? nil : cleaned
     }
     
     // MARK: - AWS Signature V4
@@ -500,6 +545,11 @@ actor S3Service {
                 segment.addingPercentEncoding(withAllowedCharacters: unreserved) ?? String(segment)
             }
             .joined(separator: "/")
+    }
+
+    private func awsURLEncodeQueryValue(_ value: String) -> String {
+        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
+        return value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? value
     }
 }
 
