@@ -35,19 +35,55 @@ actor S3Service {
             throw S3Error(message: "S3 not configured. Please add credentials in settings.")
         }
         
-        let data = try Data(contentsOf: fileURL)
-        let filename = fileURL.lastPathComponent
+        // Folders and bundles (e.g. .app) are directories, not readable as a single
+        // file. Zip them up before uploading so the whole thing goes as one .zip.
+        let data: Data
+        let filename: String
+        let values = try? fileURL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        if values?.isDirectory == true || values?.isPackage == true {
+            (data, filename) = try zipForUpload(fileURL)
+        } else {
+            data = try Data(contentsOf: fileURL)
+            filename = fileURL.lastPathComponent
+        }
+
         let baseKey = "\(UUID().uuidString.prefix(8))-\(filename)"
         let key = buildObjectKey(baseKey)
-        
-        let contentType = mimeType(for: fileURL.pathExtension)
-        
+
+        let contentType = mimeType(for: (filename as NSString).pathExtension)
+
         try await putObject(key: key, data: data, contentType: contentType, progress: progress)
         
         let url = buildPublicURL(key: key)
         return UploadResult(key: key, url: url)
     }
-    
+
+    /// Zips a folder or bundle (e.g. .app) into an in-memory .zip for upload.
+    /// Uses NSFileCoordinator's `.forUploading` option, which is sandbox-safe.
+    private func zipForUpload(_ url: URL) throws -> (data: Data, filename: String) {
+        var coordinatorError: NSError?
+        var readError: Error?
+        var result: Data?
+
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: url, options: [.forUploading], error: &coordinatorError) { zippedURL in
+            do {
+                result = try Data(contentsOf: zippedURL)
+            } catch {
+                readError = error
+            }
+        }
+
+        if let coordinatorError { throw coordinatorError }
+        if let readError { throw readError }
+        guard let data = result else {
+            throw S3Error(message: "Failed to compress \"\(url.lastPathComponent)\" for upload.")
+        }
+
+        // Keep the original name (incl. any extension like .app) and append .zip
+        return (data, "\(url.lastPathComponent).zip")
+    }
+
     // MARK: - List Objects
     
     @discardableResult
