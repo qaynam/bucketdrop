@@ -22,6 +22,7 @@ final class SettingsManager {
         static let endpoint = "s3_endpoint"
         static let publicUrlBase = "s3_public_url_base"
         static let folderPrefix = "s3_folder_prefix"
+        static let downloadBookmark = "download_directory_bookmark"
     }
     
     // Stored properties for observation
@@ -92,7 +93,87 @@ final class SettingsManager {
     var isConfigured: Bool {
         !_accessKeyId.isEmpty && !_secretAccessKey.isEmpty && !_bucket.isEmpty
     }
-    
+
+    // MARK: - Download destination
+
+    /// Observed display name for the current download folder (updates the settings UI).
+    private(set) var downloadDirectoryDisplayName: String = "Downloads"
+
+    /// True when the user has picked a custom folder (i.e. not the default Downloads).
+    var hasCustomDownloadDirectory: Bool {
+        defaults.data(forKey: Keys.downloadBookmark) != nil
+    }
+
+    /// The default Downloads folder (accessible via the downloads entitlement).
+    private var defaultDownloadDirectory: URL {
+        FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
+    }
+
+    /// Persist a user-picked folder as a security-scoped bookmark.
+    func setDownloadDirectory(_ url: URL) {
+        do {
+            let bookmark = try url.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            defaults.set(bookmark, forKey: Keys.downloadBookmark)
+        } catch {
+            defaults.removeObject(forKey: Keys.downloadBookmark)
+        }
+        refreshDownloadDirectoryDisplayName()
+    }
+
+    /// Revert to the default Downloads folder.
+    func resetDownloadDirectory() {
+        defaults.removeObject(forKey: Keys.downloadBookmark)
+        refreshDownloadDirectoryDisplayName()
+    }
+
+    /// Resolves the destination folder for downloads.
+    /// - Returns: the folder URL and whether the caller must call
+    ///   `stopAccessingSecurityScopedResource()` when finished.
+    func resolveDownloadDirectory() -> (url: URL, needsStopAccess: Bool)? {
+        guard let bookmark = defaults.data(forKey: Keys.downloadBookmark) else {
+            return (defaultDownloadDirectory, false)
+        }
+
+        var isStale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: bookmark,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else {
+            // Bookmark no longer resolvable; fall back to Downloads
+            return (defaultDownloadDirectory, false)
+        }
+
+        if isStale {
+            // Refresh the stored bookmark opportunistically
+            if let refreshed = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil) {
+                defaults.set(refreshed, forKey: Keys.downloadBookmark)
+            }
+        }
+
+        let didStart = url.startAccessingSecurityScopedResource()
+        return (url, didStart)
+    }
+
+    private func refreshDownloadDirectoryDisplayName() {
+        guard let bookmark = defaults.data(forKey: Keys.downloadBookmark) else {
+            downloadDirectoryDisplayName = defaultDownloadDirectory.lastPathComponent
+            return
+        }
+        var isStale = false
+        if let url = try? URL(resolvingBookmarkData: bookmark, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale) {
+            downloadDirectoryDisplayName = url.lastPathComponent
+        } else {
+            downloadDirectoryDisplayName = defaultDownloadDirectory.lastPathComponent
+        }
+    }
+
     private init() {
         // Load initial values from storage
         _accessKeyId = getKeychainItem(key: Keys.accessKeyId) ?? ""
@@ -102,6 +183,7 @@ final class SettingsManager {
         _endpoint = defaults.string(forKey: Keys.endpoint) ?? ""
         _publicUrlBase = defaults.string(forKey: Keys.publicUrlBase) ?? ""
         _folderPrefix = defaults.string(forKey: Keys.folderPrefix) ?? ""
+        refreshDownloadDirectoryDisplayName()
     }
     
     // MARK: - Keychain

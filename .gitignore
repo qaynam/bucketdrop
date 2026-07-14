@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Xcode - user-specific
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad
+
+# Xcode - build
+build/
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.swiftpm/
+.build/

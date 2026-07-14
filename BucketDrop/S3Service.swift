@@ -22,6 +22,11 @@ actor S3Service {
         let key: String
         let url: String
     }
+
+    struct ListResult {
+        let objects: [S3Object]
+        let nextToken: String?
+    }
     
     // MARK: - Upload
     
@@ -45,17 +50,18 @@ actor S3Service {
     
     // MARK: - List Objects
     
-    func listObjects() async throws -> [S3Object] {
+    @discardableResult
+    func listObjects(continuationToken: String? = nil) async throws -> ListResult {
         guard settings.isConfigured else {
             throw S3Error(message: "S3 not configured")
         }
-        
+
         let bucket = settings.bucket
         let host = buildHost()
         let endpoint = buildEndpoint()
         let signingPath = buildSigningPath(objectKey: nil)
-        
-        let query = buildListQuery()
+
+        let query = buildListQuery(continuationToken: continuationToken)
         let urlString = "\(endpoint)/?\(query)"
         guard let url = URL(string: urlString) else {
             throw S3Error(message: "Invalid URL")
@@ -86,8 +92,20 @@ actor S3Service {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw S3Error(message: "List failed: \(httpResponse.statusCode) - \(body)")
         }
-        
+
         return parseListResponse(data)
+    }
+
+    /// Loads every object in the bucket by following continuation tokens.
+    func listAllObjects() async throws -> [S3Object] {
+        var all: [S3Object] = []
+        var token: String? = nil
+        repeat {
+            let result = try await listObjects(continuationToken: token)
+            all.append(contentsOf: result.objects)
+            token = result.nextToken
+        } while token != nil
+        return all
     }
     
     // MARK: - Download Object
@@ -129,40 +147,29 @@ actor S3Service {
             request.setValue(value, forHTTPHeaderField: key)
         }
         
-        // Use bytes(for:) to get progress via AsyncSequence
-        let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
-        
+        // Download to a temporary file using a real download task (streams to disk,
+        // reports progress via delegate) instead of accumulating byte-by-byte.
+        let progressDelegate = DownloadProgressDelegate { written, expected in
+            guard expected > 0 else { return }
+            progress?(min(1, Double(written) / Double(expected)))
+        }
+
+        let (tempURL, response) = try await URLSession.shared.download(for: request, delegate: progressDelegate)
+
         guard let httpResponse = response as? HTTPURLResponse else {
             throw S3Error(message: "Invalid response")
         }
-        
+
         guard httpResponse.statusCode == 200 else {
             throw S3Error(message: "Download failed: \(httpResponse.statusCode)")
         }
-        
-        let expectedLength = httpResponse.expectedContentLength
-        var data = Data()
-        if expectedLength > 0 {
-            data.reserveCapacity(Int(expectedLength))
-        }
-        
-        var receivedLength: Int64 = 0
-        for try await byte in asyncBytes {
-            data.append(byte)
-            receivedLength += 1
-            
-            // Report progress periodically (every 64KB)
-            if expectedLength > 0 && receivedLength % 65536 == 0 {
-                progress?(Double(receivedLength) / Double(expectedLength))
-            }
-        }
-        
+
         progress?(1.0)
-        
-        // Write to destination
+
+        // Move the downloaded temp file to the destination
         let fileManager = FileManager.default
         var finalDestination = destination
-        
+
         if fileManager.fileExists(atPath: destination.path) {
             if overwrite {
                 try fileManager.removeItem(at: destination)
@@ -172,7 +179,7 @@ actor S3Service {
                 let filename = destination.deletingPathExtension().lastPathComponent
                 let ext = destination.pathExtension
                 var counter = 1
-                
+
                 repeat {
                     let newName = ext.isEmpty ? "\(filename) (\(counter))" : "\(filename) (\(counter)).\(ext)"
                     finalDestination = directory.appendingPathComponent(newName)
@@ -180,8 +187,8 @@ actor S3Service {
                 } while fileManager.fileExists(atPath: finalDestination.path)
             }
         }
-        
-        try data.write(to: finalDestination)
+
+        try fileManager.moveItem(at: tempURL, to: finalDestination)
         return finalDestination
     }
     
@@ -247,8 +254,12 @@ actor S3Service {
         
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
-        request.httpBody = data
-        
+        // NOTE: do not set request.httpBody here — the body is supplied via
+        // upload(for:from:) below. Setting both triggers a runtime error:
+        // "The request of a upload task should not contain a body or a body stream".
+        // Large files can take a while to upload; avoid the default 60s idle timeout
+        request.timeoutInterval = 600
+
         let headers = try signRequest(
             method: "PUT",
             path: signingPath,
@@ -376,13 +387,24 @@ actor S3Service {
         return "\(prefix)/\(baseKey)"
     }
 
-    private func buildListQuery() -> String {
-        var parts: [String] = ["list-type=2", "max-keys=50"]
+    private func buildListQuery(continuationToken: String?) -> String {
+        // SigV4 requires the canonical query string to be sorted by (encoded) key.
+        var params: [String: String] = [
+            "list-type": "2",
+            "max-keys": "100"
+        ]
         if let prefix = normalizedFolderPrefix() {
-            let encodedPrefix = awsURLEncodeQueryValue("\(prefix)/")
-            parts.append("prefix=\(encodedPrefix)")
+            params["prefix"] = "\(prefix)/"
         }
-        return parts.joined(separator: "&")
+        if let token = continuationToken, !token.isEmpty {
+            params["continuation-token"] = token
+        }
+
+        return params
+            .map { (awsURLEncodeQueryValue($0.key), awsURLEncodeQueryValue($0.value)) }
+            .sorted { $0.0 < $1.0 }
+            .map { "\($0.0)=\($0.1)" }
+            .joined(separator: "&")
     }
 
     private func normalizedFolderPrefix() -> String? {
@@ -493,10 +515,12 @@ actor S3Service {
         return mimeTypes[ext.lowercased()] ?? "application/octet-stream"
     }
     
-    private func parseListResponse(_ data: Data) -> [S3Object] {
+    private func parseListResponse(_ data: Data) -> ListResult {
         // Simple XML parsing for S3 list response
-        guard let xml = String(data: data, encoding: .utf8) else { return [] }
-        
+        guard let xml = String(data: data, encoding: .utf8) else {
+            return ListResult(objects: [], nextToken: nil)
+        }
+
         var objects: [S3Object] = []
         let contents = xml.components(separatedBy: "<Contents>")
         
@@ -521,8 +545,24 @@ actor S3Service {
             
             objects.append(S3Object(key: key, size: size, lastModified: lastModified ?? Date()))
         }
-        
-        return objects.sorted { $0.lastModified > $1.lastModified }
+
+        // Objects within a page are returned by S3 in key order; keep that order
+        // stable for infinite scroll rather than re-sorting by date per page.
+        var nextToken: String? = nil
+        if extractTag("IsTruncated", from: xml) == "true" {
+            nextToken = extractTag("NextContinuationToken", from: xml)
+        }
+
+        return ListResult(objects: objects, nextToken: nextToken)
+    }
+
+    private func extractTag(_ tag: String, from xml: String) -> String? {
+        guard let start = xml.range(of: "<\(tag)>"),
+              let end = xml.range(of: "</\(tag)>"),
+              start.upperBound <= end.lowerBound else {
+            return nil
+        }
+        return String(xml[start.upperBound..<end.lowerBound])
     }
 
     private func parseLastModified(_ value: String) -> Date? {

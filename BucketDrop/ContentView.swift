@@ -32,21 +32,45 @@ struct UploadTask: Identifiable {
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.openSettingsAction) private var openSettings
+    @Environment(\.openErrorDetailAction) private var openErrorDetail
+    @Environment(\.showToastAction) private var showToast
     @Query(sort: \UploadedFile.uploadedAt, order: .reverse) private var uploadedFiles: [UploadedFile]
-    
+
     var settings = SettingsManager.shared
-    
+
     @State private var isTargeted = false
     @State private var isUploading = false
     @State private var uploadTasks: [UploadTask] = []
     @State private var errorMessage: String?
+    @State private var errorDetail: String?
     @State private var showSettings = false
     @State private var s3Objects: [S3Object] = []
     @State private var isLoadingList = false
+
+    // Pagination / infinite scroll
+    @State private var nextToken: String?
+    @State private var isLoadingMore = false
+    @State private var isLoadingAll = false
+
+    // Search
+    @State private var showSearch = false
+    @State private var searchText = ""
+    @State private var debouncedSearchText = ""
+    @FocusState private var isSearchFocused: Bool
+
+    private var filteredObjects: [S3Object] {
+        let query = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return s3Objects }
+        return s3Objects.filter { $0.filename.localizedCaseInsensitiveContains(query) }
+    }
     
     // Download/Preview state
     @State private var downloadingObjectKey: String?
     @State private var downloadProgress: Double = 0
+    // Tracks files already saved to the download folder this session (object.key -> local URL)
+    @State private var localFiles: [String: URL] = [:]
+    // Security-scoped folder currently being accessed (kept open so Quick Look can read the file)
+    @State private var activeScopedURL: URL?
     
     var body: some View {
         VStack(spacing: 0) {
@@ -113,14 +137,26 @@ struct ContentView: View {
                         Text(error)
                             .font(.caption)
                             .foregroundStyle(.red)
+                            .lineLimit(1)
                         Spacer()
                         Button {
+                            openErrorDetail(errorDetail ?? error)
+                        } label: {
+                            Image(systemName: "exclamationmark.circle")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Show error details")
+
+                        Button {
                             errorMessage = nil
+                            errorDetail = nil
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.borderless)
+                        .help("Dismiss")
                     }
                     .padding(.horizontal, 16)
                     .padding(.bottom, 8)
@@ -130,7 +166,7 @@ struct ContentView: View {
                 
                 // Recent uploads
                 VStack(alignment: .leading, spacing: 0) {
-                    HStack {
+                    HStack(spacing: 12) {
                         Text("Recent Uploads")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -145,15 +181,69 @@ struct ContentView: View {
                                 Image(systemName: "arrow.clockwise")
                             }
                             .buttonStyle(.borderless)
+                            .help("Reload")
                         }
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                showSearch.toggle()
+                            }
+                            if showSearch {
+                                isSearchFocused = true
+                                // Load the full bucket so search covers everything, not just loaded rows
+                                Task { await loadAllObjects() }
+                            } else {
+                                searchText = ""
+                                debouncedSearchText = ""
+                            }
+                        } label: {
+                            Image(systemName: "magnifyingglass")
+                                .foregroundStyle(showSearch ? Color.accentColor : Color.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Search all files")
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                     .background(Color(nsColor: .windowBackgroundColor))
-                    
-                    if s3Objects.isEmpty && !isLoadingList {
+
+                    if showSearch {
+                        HStack(spacing: 6) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            TextField("Search all files", text: $searchText)
+                                .textFieldStyle(.plain)
+                                .font(.caption)
+                                .focused($isSearchFocused)
+                            if isLoadingAll {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .scaleEffect(0.7)
+                            }
+                            if !searchText.isEmpty {
+                                Button {
+                                    searchText = ""
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color(nsColor: .separatorColor).opacity(0.25))
+                        )
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+
+                    if filteredObjects.isEmpty && !isLoadingList && !isLoadingAll {
                         VStack {
-                            Text("No files yet")
+                            Text(debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "No files yet" : "No matches")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -161,7 +251,7 @@ struct ContentView: View {
                     } else {
                         ScrollViewReader { proxy in
                             List {
-                                ForEach(s3Objects) { object in
+                                ForEach(filteredObjects) { object in
                                     FileRowView(
                                         object: object,
                                         previewURL: previewURL(for: object),
@@ -178,11 +268,29 @@ struct ContentView: View {
                                     }
                                     .id(object.id)
                                     .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6))
+                                    .onAppear {
+                                        // Infinite scroll: load the next page when the last row appears.
+                                        // Skipped while searching, where the full bucket is already loaded.
+                                        if debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                                           object.id == s3Objects.last?.id {
+                                            Task { await loadMoreObjects() }
+                                        }
+                                    }
+                                }
+
+                                if isLoadingMore {
+                                    HStack {
+                                        Spacer()
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Spacer()
+                                    }
+                                    .listRowInsets(EdgeInsets(top: 6, leading: 6, bottom: 6, trailing: 6))
                                 }
                             }
                             .listStyle(.plain)
                             .scrollIndicators(.never)
-                            .onChange(of: s3Objects.first?.id) { _, newValue in
+                            .onChange(of: filteredObjects.first?.id) { _, newValue in
                                 guard let newValue else { return }
                                 withAnimation(.easeInOut(duration: 0.2)) {
                                     proxy.scrollTo(newValue, anchor: .top)
@@ -198,6 +306,15 @@ struct ContentView: View {
         .task {
             if settings.isConfigured {
                 await loadS3Objects()
+            }
+        }
+        .task(id: searchText) {
+            // Debounce search input by 300ms
+            do {
+                try await Task.sleep(for: .milliseconds(300))
+                debouncedSearchText = searchText
+            } catch {
+                // Task cancelled because searchText changed again; ignore
             }
         }
     }
@@ -257,8 +374,10 @@ struct ContentView: View {
         uploadTasks = urls.map { UploadTask(filename: $0.lastPathComponent, url: $0) }
         isUploading = true
         errorMessage = nil
-        
+        errorDetail = nil
+
         var uploadedURLs: [String] = []
+        var failureDetails: [String] = []
         
         // Upload files sequentially for clearer progress indication
         for index in uploadTasks.indices {
@@ -295,10 +414,19 @@ struct ContentView: View {
                 
             } catch {
                 uploadTasks[index].status = .failed(error.localizedDescription)
-                errorMessage = "Some uploads failed"
+                let filename = uploadTasks[index].filename
+                let sizeText = fileSizeText(for: uploadTasks[index].url)
+                failureDetails.append("• \(filename)\(sizeText)\n\(error.localizedDescription)")
             }
         }
-        
+
+        if !failureDetails.isEmpty {
+            errorMessage = failureDetails.count == 1
+                ? "Upload failed"
+                : "\(failureDetails.count) uploads failed"
+            errorDetail = failureDetails.joined(separator: "\n\n")
+        }
+
         // Copy all successful URLs to clipboard
         if !uploadedURLs.isEmpty {
             NSPasteboard.general.clearContents()
@@ -308,6 +436,12 @@ struct ContentView: View {
                 // Join multiple URLs with newlines
                 NSPasteboard.general.setString(uploadedURLs.joined(separator: "\n"), forType: .string)
             }
+
+            // Show a Raycast-style success toast
+            let toastMessage = uploadedURLs.count == 1
+                ? "Uploaded · link copied"
+                : "\(uploadedURLs.count) files uploaded · links copied"
+            showToast(toastMessage)
         }
         
         // Reset after delay
@@ -319,11 +453,60 @@ struct ContentView: View {
     private func loadS3Objects() async {
         isLoadingList = true
         do {
-            s3Objects = try await S3Service.shared.listObjects()
+            let result = try await S3Service.shared.listObjects()
+            s3Objects = result.objects
+            nextToken = result.nextToken
+            // If a search is active, keep loading the rest in the background
+            if !debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Task { await loadAllObjects() }
+            }
         } catch {
-            errorMessage = error.localizedDescription
+            setError("Failed to load files", detail: error.localizedDescription)
         }
         isLoadingList = false
+    }
+
+    private func loadMoreObjects() async {
+        guard !isLoadingMore, !isLoadingAll, let token = nextToken else { return }
+        isLoadingMore = true
+        do {
+            let result = try await S3Service.shared.listObjects(continuationToken: token)
+            s3Objects.append(contentsOf: result.objects)
+            nextToken = result.nextToken
+        } catch {
+            setError("Failed to load more files", detail: error.localizedDescription)
+        }
+        isLoadingMore = false
+    }
+
+    /// Loads every remaining page so search can match across the whole bucket.
+    private func loadAllObjects() async {
+        guard !isLoadingAll, nextToken != nil else { return }
+        isLoadingAll = true
+        do {
+            while let token = nextToken {
+                let result = try await S3Service.shared.listObjects(continuationToken: token)
+                s3Objects.append(contentsOf: result.objects)
+                nextToken = result.nextToken
+            }
+        } catch {
+            setError("Failed to load all files", detail: error.localizedDescription)
+        }
+        isLoadingAll = false
+    }
+
+    private func setError(_ message: String, detail: String) {
+        errorMessage = message
+        errorDetail = detail
+    }
+
+    private func fileSizeText(for url: URL) -> String {
+        guard let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64 else {
+            return ""
+        }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return " (\(formatter.string(fromByteCount: size)))"
     }
     
     private func copyToClipboard(_ object: S3Object) {
@@ -366,112 +549,75 @@ struct ContentView: View {
             try await S3Service.shared.deleteObject(key: object.key)
             await loadS3Objects()
         } catch {
-            errorMessage = error.localizedDescription
+            setError("Failed to delete file", detail: error.localizedDescription)
         }
     }
     
-    // MARK: - Cache
-    
-    private func cachedFileURL(for object: S3Object) -> URL {
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("BucketDrop")
-        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        return tempDir.appendingPathComponent(object.key)
-    }
-    
-    private func getCachedFile(for object: S3Object) -> URL? {
-        let cachedURL = cachedFileURL(for: object)
-        if FileManager.default.fileExists(atPath: cachedURL.path) {
-            return cachedURL
+    // MARK: - Download / Preview
+
+    /// Returns the local URL of the object in the download folder, downloading it there if needed.
+    /// Reused by both Download and Preview so a file is fetched only once per session.
+    private func ensureLocalFile(for object: S3Object) async throws -> URL {
+        // Reuse an already-downloaded file if it still exists
+        if let existing = localFiles[object.key], FileManager.default.fileExists(atPath: existing.path) {
+            return existing
         }
-        return nil
+
+        guard let (directory, needsStopAccess) = settings.resolveDownloadDirectory() else {
+            throw S3Service.S3Error(message: "Could not access the download folder. Pick one in Settings.")
+        }
+
+        // Release the previously held scope, then keep this one open so a follow-up
+        // Quick Look preview can still read the file from a custom (bookmarked) folder.
+        if let previous = activeScopedURL {
+            previous.stopAccessingSecurityScopedResource()
+            activeScopedURL = nil
+        }
+        if needsStopAccess {
+            activeScopedURL = directory
+        }
+
+        downloadingObjectKey = object.key
+        downloadProgress = 0
+        defer { downloadingObjectKey = nil }
+
+        // Download straight into the configured folder; S3Service picks a unique
+        // name when a different file with the same name already exists there.
+        let destination = directory.appendingPathComponent(object.filename)
+        let finalURL = try await S3Service.shared.download(key: object.key, to: destination, overwrite: false) { progress in
+            Task { @MainActor in
+                downloadProgress = progress
+            }
+        }
+
+        localFiles[object.key] = finalURL
+        return finalURL
     }
-    
-    // MARK: - Download
-    
+
     private func downloadToDownloads(_ object: S3Object) async {
-        // Show save panel first
-        let savePanel = NSSavePanel()
-        savePanel.nameFieldStringValue = object.filename
-        savePanel.canCreateDirectories = true
-        savePanel.isExtensionHidden = false
-        
-        NSApp.activate(ignoringOtherApps: true)
-        let response = await savePanel.begin()
-        
-        guard response == .OK, let destination = savePanel.url else {
-            return
-        }
-        
-        // Check if we have it cached (from Quick Look preview)
-        if let cachedURL = getCachedFile(for: object) {
-            do {
-                try FileManager.default.copyItem(at: cachedURL, to: destination)
-                NSWorkspace.shared.selectFile(destination.path, inFileViewerRootedAtPath: "")
-                return
-            } catch {
-                // Cache copy failed, fall through to download
-            }
-        }
-        
-        // Download from S3
         do {
-            downloadingObjectKey = object.key
-            downloadProgress = 0
-            
-            // Download to cache first, then copy to destination
-            let cacheURL = cachedFileURL(for: object)
-            let savedURL = try await S3Service.shared.download(key: object.key, to: cacheURL, overwrite: true) { progress in
-                Task { @MainActor in
-                    downloadProgress = progress
-                }
-            }
-            
-            // Copy from cache to user's destination
-            try FileManager.default.copyItem(at: savedURL, to: destination)
-            
-            downloadingObjectKey = nil
-            
+            let url = try await ensureLocalFile(for: object)
             // Reveal in Finder
-            NSWorkspace.shared.selectFile(destination.path, inFileViewerRootedAtPath: "")
+            NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "")
         } catch {
-            downloadingObjectKey = nil
-            errorMessage = error.localizedDescription
+            setError("Download failed", detail: error.localizedDescription)
         }
     }
-    
+
     // MARK: - Preview with Quick Look
-    
+
     private func previewFile(_ object: S3Object) {
         Task {
-            let tempFile = cachedFileURL(for: object)
-            
-            // Check if already cached
-            if let cachedURL = getCachedFile(for: object) {
-                await MainActor.run {
-                    showQuickLook(for: cachedURL)
-                }
-                return
-            }
-            
-            // Download to cache
             do {
-                downloadingObjectKey = object.key
-                downloadProgress = 0
-                
-                let savedURL = try await S3Service.shared.download(key: object.key, to: tempFile, overwrite: true) { progress in
-                    Task { @MainActor in
-                        downloadProgress = progress
-                    }
-                }
-                
-                downloadingObjectKey = nil
-                
+                // Save into the download folder first, then preview from there
+                let url = try await ensureLocalFile(for: object)
                 await MainActor.run {
-                    showQuickLook(for: savedURL)
+                    showQuickLook(for: url)
                 }
             } catch {
-                downloadingObjectKey = nil
-                errorMessage = error.localizedDescription
+                await MainActor.run {
+                    setError("Preview failed", detail: error.localizedDescription)
+                }
             }
         }
     }
@@ -758,7 +904,8 @@ struct FileRowView: View {
             Spacer(minLength: 8)
             
             // Action buttons - always in layout, opacity controlled by hover
-            HStack(spacing: 4) {
+            HStack(spacing: 6) {
+                // Copy URL stays as a dedicated button
                 Button {
                     if !isDeleting && !isDownloading {
                         onCopy()
@@ -777,39 +924,47 @@ struct FileRowView: View {
                         .foregroundStyle(isCopied ? Color.green : Color.secondary)
                 }
                 .buttonStyle(.borderless)
-                .help("Copy URL")
+                .help("Copy link")
                 .disabled(isDeleting || isDownloading)
-                
-                Button {
-                    Task {
-                        await onDownload()
+
+                // Other actions collapsed into a 3-dots dropdown menu
+                if isDeleting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 20)
+                } else {
+                    Menu {
+                        Button {
+                            Task { await onDownload() }
+                        } label: {
+                            Label("Download", systemImage: "arrow.down.circle")
+                        }
+                        Button {
+                            onPreview()
+                        } label: {
+                            Label("Preview", systemImage: "eye")
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            Task {
+                                isDeleting = true
+                                await onDelete()
+                                isDeleting = false
+                            }
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .foregroundStyle(Color.secondary)
                     }
-                } label: {
-                    Image(systemName: "arrow.down.circle")
-                        .foregroundStyle(Color.secondary)
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .frame(width: 20)
+                    .help("More actions")
+                    .disabled(isDownloading)
                 }
-                .buttonStyle(.borderless)
-                .help("Download")
-                .disabled(isDeleting || isDownloading)
-                
-                Button {
-                    Task {
-                        isDeleting = true
-                        await onDelete()
-                        isDeleting = false
-                    }
-                } label: {
-                    if isDeleting {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "trash")
-                            .foregroundStyle(Color(nsColor: .systemRed))
-                    }
-                }
-                .buttonStyle(.borderless)
-                .help("Delete")
-                .disabled(isDeleting || isDownloading)
             }
             .opacity(isHovered || isDeleting || isDownloading ? 1 : 0)
         }
